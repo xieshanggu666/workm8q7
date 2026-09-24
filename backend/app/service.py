@@ -17,6 +17,7 @@ from . import potions as potions_mod
 from . import companions as companions_mod
 from . import encounters as enc_mod
 from . import coop as coop_mod
+from . import crosschapter as xc
 from .cards import all_cards, get_card
 from .engine import Battle, _statuses_public
 from .forging import FORGE_COST, effective_card, node_name, growth_node_cost, validate_unlock
@@ -79,12 +80,26 @@ from .settlement import EffectEvent, SettlementQueue
 #        战败整队同事务回退为 lost；整程回放时间线叠加队伍事件与每步操作者。
 #        run 状态新增 coop_team（队伍 id；单人远征为 None）进入交接快照，
 #        旧 create 校验点缺该字段，回放候选按 include_coop=False 比对兼容。
-RULES_VERSION = "2.9.0"
+# 2.9.1：跨章状态统一交接/回放策略（纯重构、无规则/存档语义变更）——远征
+#        委托、奇遇印记、药水、伙伴、协作队伍等跨章状态此前在
+#        _new_run_state/_carry_from_run/_migrate_state/state_checkpoint/replay
+#        五处各维护一份字段清单与旧版穿越逻辑，新增一维必须五处同改（2.5→2.9
+#        连续四次重复、极易漏维）。现统一收敛到 app/crosschapter.py 的
+#        数据驱动注册表 FIELDS：每维声明字段名/起始版本/默认值/规范化/旧形状
+#        标记与回放穿越钩子；交接提取（extract_carry）、新章重建
+#        （value_for_new_run）、旧档迁移（migrate_run_state）、2^N 校验点
+#        形状候选与「规则先行」穿越全部由注册表统一编排。在线开章与回放重建
+#        仍共用同一条路径，续局、结算、整程回放逐位不变（历史 create 形状
+#        候选名与哈希逐位保持）；另显式修复旧损坏 carry 中 NULL 列表值穿透
+#        公开视口的隐患。
+RULES_VERSION = "2.9.1"
 GROWTH_RULES_VERSION = "2.3.0"  # 成长树规则起始版本：更早的 forge 日志走兼容重演
-COMPANION_RULES_VERSION = "2.6.0"  # 伙伴字段进入 run 状态：更早日志的迁移步前按 legacy 比对
 BLOCK_RULES_VERSION = "2.7.0"  # 格挡/援护结算顺序修复：更早日志的战斗动作走旧时序重演
-ENCOUNTER_RULES_VERSION = "2.8.0"  # 奇遇链：enc_state 进入 run 状态与交接快照
-COOP_RULES_VERSION = "2.9.0"  # 协作远征：coop_team 进入 run 状态与交接快照
+# 各跨章状态维进入 run 状态的版本号单一来源在 crosschapter.FIELDS（注册表）；
+# 以下别名保留给历史命名，定义值直接取注册表，杜绝两份版本号漂移。
+COMPANION_RULES_VERSION = xc.FIELD_BY_KEY["companion"].since
+ENCOUNTER_RULES_VERSION = xc.FIELD_BY_KEY["enc_state"].since
+COOP_RULES_VERSION = xc.FIELD_BY_KEY["coop_team"].since
 
 
 def _ver_lt(ver, baseline):
@@ -160,10 +175,8 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
             "next_card_seq": len(deck_uids) + 1,
             "relics": {}, "gold": 0,
             "max_health": 75, "health": 75, "base_energy": 3,
-            "potions": [],
-            "companion": None,
-            "enc_state": enc_mod.fresh_state(),
-            "coop_team": None,
+            **xc.fresh_carry_defaults(),
+            "commissions": [], "next_commission_seq": 1,
         }
         heal = 0
         opener_heal = 0
@@ -173,17 +186,32 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
     # 兼容旧章交接快照（2.3.0 之前的 carry 里可能是 forges 结构）
     _normalize_instances(instances)
     max_hp = carry.get("max_health", 75)
-    # 奇遇状态随交接快照继承；旧章快照缺字段（或整体缺失）时补全新结构
-    enc_state, _enc_norm = enc_mod.normalize_state(copy.deepcopy(carry.get("enc_state")))
+    # 奇遇印记随交接快照继承；旧章快照缺字段（或整体缺失）时补全新结构。
+    # 该维还承担开章语义（节点级痕迹重置 + flag 预兆兑现），在注册表取值后
+    # 统一处理；在线推进与回放重建共用本函数，逐位一致。
+    enc_field = xc.FIELD_BY_KEY["enc_state"]
+    enc_state, _enc_norm = enc_mod.normalize_state(
+        xc.value_for_new_run(carry, enc_field))
     chapter_for_enc = chapter if chapter is not None else carry.get("chapter")
     if chapter_for_enc is not None and chapter_for_enc > 1:
         # 进入新章：节点级痕迹清空（保留跨章 flag/已完成链），再兑现各 flag 的
-        # 一次性预兆。在线推进与回放重建共用本函数，逐位一致。
+        # 一次性预兆。
         enc_mod.reset_for_chapter(enc_state)
         opener_heal, _opened_flags = enc_mod.on_chapter_begin(enc_state, chapter_for_enc)
     else:
         opener_heal = 0
     start_health = min(max_hp, max(1, carry.get("health", max_hp)) + heal + opener_heal)
+
+    # 注册跨章状态维统一从交接快照重建（旧快照缺维补默认值）；协作开章可显式带队伍 id。
+    cross_values = {}
+    for f in xc.FIELDS:
+        if f.key == "enc_state":
+            cross_values[f.key] = enc_state
+        elif f.key == "coop_team":
+            cross_values[f.key] = xc.value_for_new_run(carry, f, override=coop_team)
+        else:
+            cross_values[f.key] = xc.value_for_new_run(carry, f)
+
     return {
         "seed": seed,
         "rules_version": RULES_VERSION,
@@ -197,12 +225,8 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
         "next_card_seq": carry.get("next_card_seq", len(instances) + 1),  # uid 单调发号器
         "gold": carry.get("gold", 0),
         "relics": dict(carry.get("relics", {})),
-        # 药水背包：按下标排列的药水 id 列表（限容量，可跨章携带）；旧章快照缺省为空
-        "potions": list(carry.get("potions", [])),
-        # 伙伴：持久招募状态（id/mode/hp/wounded），随行/负伤随快照跨章继承
-        "companion": copy.deepcopy(carry.get("companion")),
-        # 跨章节奇遇链状态：flag/预兆/伏击/已结清链随交接继承（2.8.0）
-        "enc_state": enc_state,
+        # 跨章状态维（药水背包/伙伴/奇遇印记/协作队伍）由注册表统一注入
+        **cross_values,
         # 远征委托：uid 单调发号器 + 委托实例（接取/进度/领奖/超期/战败失败）
         "next_commission_seq": carry.get("next_commission_seq", 1),
         "commissions": copy.deepcopy(carry.get("commissions", [])),
@@ -212,8 +236,6 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
         "chapter": chapter if chapter is not None else carry.get("chapter"),
         "chapters_total": (chapters_total if chapters_total is not None
                            else carry.get("chapters_total")),
-        # 2.9.0：协作队伍归属（普通局/单人远征为 None）；新章默认从交接快照继承
-        "coop_team": (coop_team if coop_team is not None else carry.get("coop_team")),
         "in_battle": False,
         "battle_index": 0,
         "battle": None,
@@ -289,41 +311,10 @@ def _migrate_state(run):
     if b and isinstance(b.get("card_instances"), dict):
         # 战斗内快照实例表与 run 级表一致迁移（旧档迁移时两者是同一 dict 的拷贝）
         _normalize_instances(b["card_instances"])
-    # 旧档补记当前规则版本（仅标注；旧动作日志仍按 legacy 处理不做哈希校验）
-    if "rules_version" not in run:
-        run["rules_version"] = RULES_VERSION
-        changed = True
-    run.setdefault("forge_claimed", True)
-    run.setdefault("shop", None)
-    # 2.2.0：远征委托相关字段（旧档/老普通局无此字段）
-    run.setdefault("commissions", [])
-    run.setdefault("next_commission_seq", 1)
-    run.setdefault("chapter", None)
-    run.setdefault("chapters_total", None)
-    run.setdefault("expedition_id", None)
-    # 2.5.0：跨章药水背包（旧档无此字段，空背包开局；结构变化随本步原子落库）
-    if "potions" not in run:
-        run["potions"] = []
-        changed = True
-    companion, companion_changed = companions_mod.normalize_state(run.get("companion"))
-    if "companion" not in run:
-        run["companion"] = None
-        changed = True
-    elif companion_changed:
-        run["companion"] = companion
-        changed = True
-    # 2.8.0：跨章节奇遇链状态（旧档无此字段：补全新结构，随本步原子落库）
-    if "enc_state" not in run:
-        run["enc_state"] = enc_mod.fresh_state()
-        changed = True
-    else:
-        enc_state, enc_changed = enc_mod.normalize_state(run["enc_state"])
-        run["enc_state"] = enc_state
-        if enc_changed:
-            changed = True
-    # 2.9.0：协作远征队伍归属（旧档无此字段：单人/旧远征补 None，随本步原子落库）
-    if "coop_team" not in run:
-        run["coop_team"] = None
+    run.setdefault("rules_version", RULES_VERSION)
+    # 注册跨章状态维（药水背包/伙伴/奇遇印记/协作队伍）+ 远征早期字段统一
+    # 缺省补齐与规范化：旧档首次载入（续局/首行动）随本步动作原子落库。
+    if xc.migrate_run_state(run, extra_defaults=xc.LEGACY_RUN_DEFAULTS):
         changed = True
     return changed
 
@@ -361,27 +352,14 @@ def _chapter_seed(exp_seed, chapter):
 
 
 def _carry_from_run(run):
-    """章节通关后的「奖励交接」快照：牌组（含锻造成长）、遗物、金币、生命与能量上限，
-    以及远征委托（含进度/可领奖/已终结状态）与委托 uid 发号器。"""
-    instances = run.get("card_instances", {})
-    return {
-        "deck": list(run["deck"]),
-        "card_instances": copy.deepcopy(instances),
-        "next_card_seq": run.get("next_card_seq", len(instances) + 1),
-        "relics": dict(run["relics"]),
-        "gold": run["gold"],
-        "max_health": run["max_health"],
-        "health": run["health"],
-        "base_energy": run.get("base_energy", 3),
-        "potions": list(run.get("potions", [])),
-        "companion": copy.deepcopy(run.get("companion")),
-        "enc_state": copy.deepcopy(run.get("enc_state")),
-        "commissions": copy.deepcopy(run.get("commissions", [])),
-        "next_commission_seq": run.get("next_commission_seq", 1),
-        "coop_team": run.get("coop_team"),
-        "chapter": run.get("chapter"),
-        "chapters_total": run.get("chapters_total"),
-    }
+    """章节通关后的「奖励交接」快照。
+
+    牌组（含锻造成长）、遗物、金币、生命与能量上限、远征委托（含进度/
+    可领奖/已终结状态）与委托 uid 发号器，以及注册表中的全部跨章状态维
+    （药水背包/伙伴/奇遇印记/协作队伍）统一提取——交接清单只有一份
+    （crosschapter.FIELDS），新增维度不再需要在交接/重建/回放三处各补一遍。
+    """
+    return xc.extract_carry(run)
 
 
 def _exp_badge(exp):
@@ -414,13 +392,16 @@ def _carry_public(carry):
         "relics": dict(carry.get("relics", {})),
         "health": carry.get("health"),
         "max_health": carry.get("max_health"),
-        "potions": [potions_mod.public_potion(pid) for pid in carry.get("potions", [])],
+        # 注册跨章维的公开摘要；旧损坏快照里 NULL 值按各维默认值兜底
+        "potions": [
+            potions_mod.public_potion(pid)
+            for pid in (carry.get("potions") or [])],
         "companion": companions_mod.public_companion(carry.get("companion")),
         "encounter_flags": enc_mod.flags_public(
             carry.get("enc_state"), carry.get("chapter") or 0),
         "commissions": [
             commission_mod.commission_public(c, carry.get("chapter") or 0)
-            for c in carry.get("commissions", [])
+            for c in (carry.get("commissions") or [])
         ],
     }
 
@@ -2705,15 +2686,18 @@ def resume(run_id, member_id=None):
 # - _pending_unlock 是在线行动在内存中暂存的战败解锁，随事务提交到 profile，
 #   不属于 run 状态本身（绝不写入 state_json）
 _PENDING_UNLOCK_KEY = "_pending_unlock"
-_LEGACY_NO_COMPANION_KEY = "_legacy_no_companion"
-_LEGACY_NO_POTIONS_KEY = "_legacy_no_potions"
+# 旧规则区间瞬态标记：值由 crosschapter 注册表单一提供（回放/旧版夹具共用），
+# 这里保留模块级短名供 _choose_node/_after_battle_step 与历史测试引用。
+_LEGACY_NO_COMPANION_KEY = xc.FIELD_BY_KEY["companion"].marker_key
+_LEGACY_NO_POTIONS_KEY = xc.FIELD_BY_KEY["potions"].marker_key
 # 仅存在于回放内存 run：当前是否仍处于 2.7.0 之前的旧格挡时序（不写入存档、
 # 不参与校验点哈希）。_load_battle 据此给 Battle 置 legacy_block。
 _LEGACY_BLOCK_KEY = "_legacy_block"
+# 回放瞬态标记统一收录注册表 marker（各跨章维的「旧规则区间」标记）。
 _CKPT_SKIP_KEYS = {
-    "events_log", _PENDING_UNLOCK_KEY, _LEGACY_NO_COMPANION_KEY,
-    _LEGACY_NO_POTIONS_KEY, _LEGACY_BLOCK_KEY, "_ckpt_skip_keys",
-}
+    "events_log", _PENDING_UNLOCK_KEY,
+    _LEGACY_BLOCK_KEY, "_ckpt_skip_keys",
+} | xc.MARKER_KEYS
 
 
 def state_checkpoint(run, include_companion=True, include_potions=True,
@@ -2721,31 +2705,39 @@ def state_checkpoint(run, include_companion=True, include_potions=True,
     """权威状态校验点：对完整 run 状态取稳定哈希（SHA-256 截断 16 位）。
 
     include_*=False 仅用于旧规则升级时的历史初态/迁移前哈希兼容：
-    2.8.0 之前的 create 状态没有 enc_state，重放旧 create 事件时按
-    include_encounters=False 比对；2.9.0 之前没有 coop_team，同维再剥一层。
+    各开关一一对应 crosschapter.FIELDS 注册的结构维（2.6 伙伴 / 2.5 药水 /
+    2.8 印记 / 2.9 协作），字段尚未进入 run 状态的旧 create 校验点按缺该维
+    的形状比对。
     """
     skip = set(_CKPT_SKIP_KEYS)
-    if not include_companion:
-        skip.add("companion")
-    if not include_potions:
-        skip.add("potions")
-    if not include_encounters:
-        skip.add("enc_state")
-    if not include_coop:
-        skip.add("coop_team")
+    present = {
+        "companion": include_companion,
+        "potions": include_potions,
+        "enc_state": include_encounters,
+        "coop_team": include_coop,
+    }
+    for f in xc.FIELDS:
+        if not present[f.key]:
+            skip.add(f.key)
     material = {k: v for k, v in run.items() if k not in skip}
     blob = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 def _create_ckpt_candidates(seed, create_payload):
-    """回放开章：构造「修复后正确初态」与「旧版错误初态」两种候选及其校验点。
+    """回放开章：构造「修复后正确初态」与「旧版错误初态」两种候选及校验点。
 
     2.4.0 之前的跨章 run 用 carry 里的来源章号覆盖了新章号；create 事件里记录的
     ckpt 是错误初态的哈希。比对记录值即可识别受影响旧日志：记录命中错误候选、
     且不等于正确候选 -> 本 run 是受影响章，回放走兼容修复路径。
-    返回 (正确初态, 正确ckpt, 错误ckpt 或 None)。
+
+    注册跨章状态维（药水/伙伴/印记/协作）的 2^N 种「字段形状」候选由
+    crosschapter.FIELDS 驱动：录制的 create ckpt 命中哪种形状，回放起点就按
+    哪种形状对齐（旧版初态哈希逐位可比），首个当前版本动作之前按 legacy。
+    返回 (正确初态, 比对用 create ckpt, 错误ckpt 或 None, present_flags)，
+    present_flags: {field_key: 该 create 形状是否含此字段}。
     """
+    import itertools
     carry = create_payload.get("carry") if not create_payload.get("_corrupt") else None
     chapter = create_payload.get("chapter")
     total = create_payload.get("chapters_total")
@@ -2759,10 +2751,8 @@ def _create_ckpt_candidates(seed, create_payload):
     if recorded_ver:
         sim["rules_version"] = recorded_ver
 
-    def _ckpt(state, comp, pot, enc, coop):
-        return state_checkpoint(state, include_companion=comp,
-                                include_potions=pot, include_encounters=enc,
-                                include_coop=coop)
+    def _ckpt(state, present):
+        return state_checkpoint(state, **xc.checkpoint_kwargs(present))
 
     buggy = None
     if carry is not None and chapter is not None and chapter > 1:
@@ -2773,37 +2763,29 @@ def _create_ckpt_candidates(seed, create_payload):
             expedition_id=create_payload.get("expedition"))
         if recorded_ver:
             buggy["rules_version"] = recorded_ver
-    # 16 种「字段形状」候选：companion（2.6.0）/potions（2.5.0）/encounters（2.8.0）
-    # /coop（2.9.0）四个结构维各自是否参与哈希。录制的 create ckpt 命中哪种形状，
-    # 本 run 回放起点就按哪种形状对齐——旧版初态哈希逐位可比，首个当前版本动作
-    # 之前按 legacy。顺序至关重要：优先尝试「完整形状」，再逐维剥字段（coop 维在
-    # 最内层，保证旧版本候选只是新版候选的后缀）。
+    # 2^N 种字段形状候选（N=注册维数）。按注册表维序的逆序嵌套，保证旧版本
+    # 候选只是新版候选的后缀、完整形状最先尝试——与 2.5~2.9 历史逐位一致。
     shapes = []
-    for coop in (True, False):
-        for enc in (True, False):
-            for pot in (True, False):
-                for comp in (True, False):
-                    name = ("full" if comp and pot and enc and coop
-                            else f"c{int(comp)}p{int(pot)}e{int(enc)}o{int(coop)}")
-                    buggy_hash = _ckpt(buggy, comp, pot, enc, coop) if buggy is not None else None
-                    shapes.append((name, comp, pot, enc, coop, buggy_hash,
-                                   _ckpt(sim, comp, pot, enc, coop)))
+    for bits in itertools.product((True, False), repeat=len(xc.FIELDS)):
+        present = {f.key: flag for f, flag in zip(xc.FIELDS, bits)}
+        name = xc.shape_name(present)
+        buggy_hash = _ckpt(buggy, present) if buggy is not None else None
+        shapes.append((name, present, buggy_hash, _ckpt(sim, present)))
     recorded = create_payload.get("ckpt") if not create_payload.get("_corrupt") else None
-    matched = shapes[0]  # 默认 full
+    matched = next(s for s in shapes if s[0] == "full")  # 默认 full
     if recorded is not None:
         for shape in shapes:
-            if recorded in (shape[5], shape[6]):
+            # shape: (name, present, buggy_hash, fixed_hash)
+            if recorded in (shape[2], shape[3]):
                 matched = shape
                 break
-    # 返回的布尔是「字段缺席」（pre-version，与既有 pre_* 语义一致）：True 表示
-    # 该 create 形状里没有该字段、首个新版动作之前按 legacy。
-    _name, has_companion, has_potions, has_enc, has_coop, matched_buggy_ckpt, _ = matched
+    _name, matched_present, matched_buggy_ckpt, _fixed_full = matched
     # create 帧实际比对值：录制值命中任一候选形状时直接用它（旧形状 create 帧
     # 因此可标记 ok；受影响章的 create 由 create_of_legacy 另行豁免），录制值
     # 缺失/全不匹配（损坏或规则漂移）时用完整形状哈希，让比对暴露 mismatch。
-    fixed_ckpt = recorded if recorded is not None else _ckpt(sim, True, True, True, True)
-    return (sim, fixed_ckpt, matched_buggy_ckpt,
-            not has_companion, not has_potions, not has_enc, not has_coop)
+    fixed_ckpt = recorded if recorded is not None else _ckpt(
+        sim, {f.key: True for f in xc.FIELDS})
+    return sim, fixed_ckpt, matched_buggy_ckpt, dict(matched_present)
 
 
 def _replay_commission_maps(conn, exp_id, run_id):
@@ -2883,21 +2865,17 @@ def replay(run_id):
          if e.get("action") == "create" and isinstance(e.get("payload"), dict)),
         {},
     )
-    # 修复后正确初态 + 旧版错误初态两个候选：用记录的 create ckpt 识别受影响旧日志
-    (sim, initial_ckpt, buggy_ckpt,
-     pre_companion_create, pre_potions_create, pre_enc_create,
-     pre_coop_create) = _create_ckpt_candidates(
+    # 修复后正确初态 + 旧版错误初态两个候选：用记录的 create ckpt 识别受影响旧日志。
+    # 各注册跨章维的 create 形状（字段是否在场）由注册表候选统一匹配。
+    sim, initial_ckpt, buggy_ckpt, present_at_create = _create_ckpt_candidates(
         seed, create_payload)
+    # field_key -> 该 create 形状是否缺该维（缺则首个 since+ 动作之前按 legacy）
+    pre_field_create = {f.key: not present_at_create[f.key] for f in xc.FIELDS}
+    pre_field_replay = dict(pre_field_create)
+    # field_key -> 是否已越过该维的结构迁移点
+    field_crossed = {f.key: not pre_field_create[f.key] for f in xc.FIELDS}
     recorded_initial = (create_payload.get("ckpt")
                         if not create_payload.get("_corrupt") else None)
-    pre_companion_replay = pre_companion_create
-    pre_potions_replay = pre_potions_create
-    pre_enc_replay = pre_enc_create
-    pre_coop_replay = pre_coop_create
-    companion_migration_seen = not pre_companion_replay
-    potions_migration_seen = not pre_potions_replay
-    enc_migration_seen = not pre_enc_replay
-    coop_migration_seen = not pre_coop_replay
     # 2.7.0 格挡/援护顺序修复：无存档结构变更，create 形状无法区分新旧——
     # 统一按「首个 2.7.0+ 动作之前为旧时序」处理。在线路径上旧战斗中存档
     # 在玩家回合边界落库，升级后的首个动作（可能直接就是 end_turn）即按新
@@ -2934,15 +2912,11 @@ def replay(run_id):
             revive_chapter=fixed_chapter)
         # 货架未接取挂单同样重新锚定到真实当前章（在线修复同款，保证逐位一致）
         reanchor_shop_commission_offers(sim.get("shop"), fixed_chapter, chapters_total)
-    if pre_companion_replay:
-        sim[_LEGACY_NO_COMPANION_KEY] = True
-        if sim.get("shop"):
-            sim["shop"].pop("companions", None)
-    if pre_potions_replay:
-        sim[_LEGACY_NO_POTIONS_KEY] = True
-        sim["potions"] = []
-        if sim.get("shop"):
-            sim["shop"].pop("potions", None)
+    # 旧 create 形状缺某维：把回放起点标记进该维旧规则区间（补旧形态/剥旧货架）。
+    # 与在线旧档语义对齐，结构穿越发生在首个 since+ 动作【之前】。
+    for f in xc.FIELDS:
+        if pre_field_replay[f.key]:
+            f.enter_legacy(sim)
     # 远征章节 run：帧视口携带远征摘要（只读，不阻断回放）
     exp_badge = None
     if rec.get("expedition_id"):
@@ -2960,6 +2934,12 @@ def replay(run_id):
     gap_steps = 0
     post_fix = not legacy_chapter  # 已越过在线迁移点（2.4.0 新事件）-> 恢复严格校验
 
+    def _cross_field(f):
+        """该维首个 since+ 动作之前完成结构切换（规则先行，与在线迁移对齐）。"""
+        field_crossed[f.key] = True
+        pre_field_replay[f.key] = False
+        f.cross(sim)
+
     for ev in events:
         payload = ev.get("payload") or {}
         corrupt_row = bool(payload.get("_corrupt"))
@@ -2971,72 +2951,36 @@ def replay(run_id):
             versions.add(ver)
         a = ev["action"]
         # 结构迁移点必须在推演本步动作【之前】切换规则：在线路径上 /resume 迁移
-        # （无日志，首个 2.5.0/2.6.0 事件之前）与 /act 迁移（本步动作推演之前）
-        # 都已让新规则生效。若在动作之后才切换，首个新版动作若是「进入新商店」，
-        # 回放仍按旧规则生成库存（缺药水/伙伴货架），后续升级后的购买动作将无法
-        # 重放，在线与回放的库存/背包随之分叉。create 事件不产生状态变化，不切换。
-        crossing_companion = (a != "create" and pre_companion_replay
-                              and not companion_migration_seen
-                              and ver and not _ver_lt(ver, COMPANION_RULES_VERSION))
-        crossing_potions = (a != "create" and pre_potions_replay
-                            and not potions_migration_seen
-                            and ver and not _ver_lt(ver, "2.5.0"))
+        # （无日志，首个新版事件之前）与 /act 迁移（本步动作推演之前）都已让
+        # 新规则生效。若在动作之后才切换，首个新版动作若是「进入新商店」，回放
+        # 仍按旧规则生成库存（缺该维货架），后续升级后的购买动作将无法重放，
+        # 在线与回放随之分叉。create 事件不产生状态变化，不切换。
+        crossing_fields = [
+            f for f in xc.FIELDS
+            if a != "create" and pre_field_replay[f.key] and not field_crossed[f.key]
+            and ver and not _ver_lt(ver, f.since)]
         # 格挡规则修复点：首个携带 2.7.0+ 版本的动作（含战斗动作）之前一切
         # 按旧格挡时序推演；本动作本身在线上已是修复后语义（规则先行切换）。
         crossing_block = (a != "create" and not block_rule_seen
                           and ver and not _ver_lt(ver, BLOCK_RULES_VERSION))
-        # 2.8.0 奇遇链结构（enc_state 进入 run 状态/交接快照）：旧 create 形状
-        # 缺该字段，首个 2.8.0+ 动作之前先补全新状态（与在线 _migrate_state 对齐）。
-        crossing_enc = (a != "create" and pre_enc_replay
-                        and not enc_migration_seen
-                        and ver and not _ver_lt(ver, ENCOUNTER_RULES_VERSION))
-        # 2.9.0 协作远征结构（coop_team 进入 run 状态/交接快照）：旧 create 形状
-        # 缺该字段，首个 2.9.0+ 动作之前先补 None（与在线 _migrate_state 对齐）。
-        crossing_coop = (a != "create" and pre_coop_replay
-                         and not coop_migration_seen
-                         and ver and not _ver_lt(ver, COOP_RULES_VERSION))
         # 受影响旧日志的修复点（2.4.0 跨章章号错位）：首个当前版本事件之前一切
         # 按 legacy 修复路径重放；越过该点后恢复严格校验。
         at_fix_point = (legacy_chapter and not post_fix and a != "create"
                         and (migrated_step or (ver and not _ver_lt(ver, RULES_VERSION))
-                             or crossing_companion or crossing_potions
-                             or crossing_block or crossing_enc or crossing_coop))
-        if (at_fix_point or crossing_companion or crossing_potions
-                or crossing_block or crossing_enc or crossing_coop):
-            if crossing_companion:
-                companion_migration_seen = True
-                sim.pop(_LEGACY_NO_COMPANION_KEY, None)
-                sim.setdefault("companion", None)
-            if crossing_potions:
-                potions_migration_seen = True
-                sim.pop(_LEGACY_NO_POTIONS_KEY, None)
-                sim.setdefault("potions", [])
-            if crossing_enc:
-                enc_migration_seen = True
-                sim["enc_state"] = enc_mod.fresh_state()
-            if crossing_coop:
-                coop_migration_seen = True
-                sim.setdefault("coop_team", None)
+                             or crossing_fields or crossing_block))
+        if crossing_fields or crossing_block:
+            for f in crossing_fields:
+                _cross_field(f)
             if crossing_block:
                 block_rule_seen = True
                 sim.pop(_LEGACY_BLOCK_KEY, None)
         if at_fix_point:
             post_fix = True
-            # 2.4.0 修复点会同时越过伙伴/药水/奇遇迁移（首个当前版本事件不可能早于它们）
-            if not companion_migration_seen:
-                companion_migration_seen = True
-                sim.pop(_LEGACY_NO_COMPANION_KEY, None)
-                sim.setdefault("companion", None)
-            if not potions_migration_seen:
-                potions_migration_seen = True
-                sim.pop(_LEGACY_NO_POTIONS_KEY, None)
-                sim.setdefault("potions", [])
-            if not enc_migration_seen:
-                enc_migration_seen = True
-                sim["enc_state"] = enc_mod.fresh_state()
-            if not coop_migration_seen:
-                coop_migration_seen = True
-                sim.setdefault("coop_team", None)
+            # 2.4.0 修复点会同时越过后续所有结构维迁移（首个当前版本事件不可能
+            # 早于它们）：逐维统一切换，顺序与注册表声明顺序一致。
+            for f in xc.FIELDS:
+                if not field_crossed[f.key]:
+                    _cross_field(f)
             if not block_rule_seen:
                 block_rule_seen = True
                 sim.pop(_LEGACY_BLOCK_KEY, None)
@@ -3045,34 +2989,29 @@ def replay(run_id):
                       and a != "create" and not at_fix_point)
         create_of_legacy = (legacy_chapter and a == "create"
                             and not post_fix)
-        # 仍处于旧结构区间的步骤：伙伴/药水字段在记录哈希中缺席（旧形状）。
+        # 仍处于各跨章维旧结构区间的步骤（注册表驱动）：该维在记录哈希中缺席。
         # 跨越结构迁移的本步不再属于旧区间——在线迁移先于本步动作，逐位可比。
-        pre_companion_step = (pre_companion_replay and not companion_migration_seen
-                              and a != "create")
-        pre_potions_step = (pre_potions_replay and not potions_migration_seen
-                            and a != "create")
-        pre_enc_step = (pre_enc_replay and not enc_migration_seen
-                        and a != "create")
-        pre_coop_step = (pre_coop_replay and not coop_migration_seen
-                         and a != "create")
+        pre_field_step = {
+            f.key: (pre_field_replay[f.key] and not field_crossed[f.key]
+                    and a != "create")
+            for f in xc.FIELDS}
+        any_pre_field_step = any(pre_field_step.values())
         # 仍处于旧格挡时序区间的步骤（2.7.0 修复点之前）：同一动作在旧时序下
         # 的落库状态与新推演不同（格挡/承伤/伙伴生命），按 legacy 呈现并跳过
         # 哈希比对；动作仍经 legacy_block 旧时序逐位重演。纯规则修复、无结构
         # 变化，因此 create 帧不豁免（create 不含战斗，旧/新初态逐位相同）。
         pre_block_step = (not block_rule_seen and a != "create")
-        # migrated 步（本步事务内发生旧档结构升级：裸 id 牌组 -> 实例、补伙伴/
-        # 药水字段等）：记录的 ckpt 是「迁移后」状态，回放起点却已是新结构，
+        # migrated 步（本步事务内发生旧档结构升级：裸 id 牌组 -> 实例、补各
+        # 跨章字段等）：记录的 ckpt 是「迁移后」状态，回放起点却已是新结构，
         # 结构性差异使本步哈希不可逐位比较——一律按 legacy 呈现、跳过比对；
         # 但动作仍按迁移后的新规则推演（上面的 crossing 已切换规则），保证
         # 迁移点上的新商店/战利品与在线一致、后续升级后的动作严格校验。
         # 损坏行没有可信版本号，按旧日志处理但仍会因推演失败标注 error
         is_legacy = not ver
-        skip_ckpt = (corrupt_row or migrated_step or pre_repair
-                     or create_of_legacy or pre_companion_step or pre_potions_step
-                     or pre_block_step or pre_enc_step or pre_coop_step)
-        if (is_legacy or migrated_step or pre_repair or create_of_legacy
-                or pre_companion_step or pre_potions_step or pre_block_step
-                or pre_enc_step or pre_coop_step):
+        legacy_struct = (migrated_step or pre_repair or create_of_legacy
+                         or any_pre_field_step or pre_block_step)
+        skip_ckpt = corrupt_row or legacy_struct
+        if is_legacy or legacy_struct:
             legacy_steps += 1
         if pre_repair:
             repaired_steps += 1
@@ -3109,20 +3048,17 @@ def replay(run_id):
                         replay_action["_legacy_offer"] = offer
                         replay_action["_legacy_ignore_cap"] = True
                 log = _apply_action(sim, a, replay_action, map_data, grant_unlocks=False)
-                # 仍在旧结构区间时，动作产生的商店库存也必须保持旧形状
-                # （伙伴/药水货架是随字段升级才加入的规则产物；战后药水战利品
-                # 已在 _after_battle_step 按 include_potions 旧规则不生成）。
-                # 注意：这里以【本步录制版本】为准，而不是字段迁移标记——2.4.0
-                # 单局的 create 形状已含 potions 键（结构早在 2.5.0 之前的某版
-                # 补入），但 2.4.0 动作生成的商店确实没有药水货架，必须照剥。
-                step_pre_companion = (ver and _ver_lt(ver, COMPANION_RULES_VERSION)) \
-                    or (not ver and not companion_migration_seen)
-                step_pre_potions = (ver and _ver_lt(ver, "2.5.0")) \
-                    or (not ver and not potions_migration_seen)
-                if sim.get("shop") and step_pre_companion:
-                    sim["shop"].pop("companions", None)
-                if sim.get("shop") and step_pre_potions:
-                    sim["shop"].pop("potions", None)
+                # 仍在某维旧结构区间时，该动作产生的商店库存也必须保持旧形状
+                # （对应货架是随字段升级才加入的规则产物；战后药水战利品也按
+                # 旧规则不生成）。注意：这里以【本步录制版本】为准，而不是只看
+                # 迁移标记——2.4.0 单局的 create 形状已含 potions 键（结构早在
+                # 2.5.0 之前的某版补入），但 2.4.0 动作生成的商店确实没有药水
+                # 货架，必须照剥。无版本号则看该维是否已越过迁移点。
+                if sim.get("shop"):
+                    for f in xc.FIELDS:
+                        if f.shop_shelf and xc.step_is_pre_field(
+                                ver, f, field_crossed[f.key]):
+                            f.strip_shop_shelf(sim)
             except Exception as e:  # 损坏/越权动作不抹掉整段回放：断在此步并标注
                 error = f"{type(e).__name__}: {e}"
                 skipped_errors += 1
@@ -3130,14 +3066,10 @@ def replay(run_id):
         # create 帧在循环外已完成修复/兼容形状调整：直接使用候选校验点，
         # 不再对修复后的 sim 重新取哈希（修复前记录的就是待修复初态）。
         # migrated 步跳过比对（recorded=None），哈希取完整形状即可。
-        # _legacy_block 是回放瞬态键（_CKPT_SKIP_KEYS），不影响哈希取值。
+        # _legacy_block 与各维 marker 是回放瞬态键（_CKPT_SKIP_KEYS），不影响哈希。
         actual = initial_ckpt if a == "create" else state_checkpoint(
-            sim,
-            include_companion=not pre_companion_step,
-            include_potions=not pre_potions_step,
-            include_encounters=not pre_enc_step,
-            include_coop=not pre_coop_step,
-        )
+            sim, **xc.checkpoint_kwargs(
+                {f.key: not pre_field_step[f.key] for f in xc.FIELDS}))
         if error:
             status = "error"
         elif not recorded:
@@ -3164,9 +3096,7 @@ def replay(run_id):
             "view": _public_view(sim, map_data, run_id, include_unlocks=False,
                                  expedition=exp_badge),
             "check": status,
-            "legacy": (is_legacy or migrated_step or pre_repair
-                       or create_of_legacy or pre_companion_step or pre_potions_step
-                       or pre_block_step or pre_enc_step or pre_coop_step),
+            "legacy": bool(is_legacy or legacy_struct),
             "migrated": migrated_step,
             "repaired": pre_repair,
             "error": error,
